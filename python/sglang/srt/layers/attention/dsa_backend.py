@@ -2538,7 +2538,9 @@ class DeepseekSparseAttnBackend(
         # Extend/prefill q rows = number of prefill tokens in a chunk, not
         # max_batch. b12x prefill scratch must fit chunked_prefill_size (sglang
         # chunks long prefills to this), else 'q rows N exceed scratch capacity'.
-        chunked_prefill_size = model_runner.server_args.chunked_prefill_size
+        from sglang.srt.server_args import get_global_server_args
+
+        chunked_prefill_size = get_global_server_args().chunked_prefill_size
         if chunked_prefill_size is None or chunked_prefill_size <= 0:
             chunked_prefill_size = max_batch
         max_q_rows_extend = max(max_batch, int(chunked_prefill_size))
