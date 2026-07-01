@@ -2537,6 +2537,20 @@ class DeepseekSparseAttnBackend(
         max_q_rows = max_batch  # decode: 1 row / request
         max_width = self.dsa_index_topk
 
+        # b12x prefill kernel requires q heads divisible by HPB=16 (decode
+        # supports valid_hpb<16 via its own sharding). On TP8 GLM-5.2
+        # (64 heads -> 8/rank) prefill must pad 8 -> 16 by repeating heads.
+        # MLA absorbed q head-repeat is math-safe: each head's softmax is
+        # independent, so duplicating a head and discarding the copy yields
+        # the same result. Mirrors the HIP/aiter need_pad_heads mechanism.
+        self._b12x_need_pad_heads = self.num_q_heads < 16
+        self._b12x_head_repeat_factor = (
+            16 // self.num_q_heads if self.num_q_heads < 16 else 1
+        )
+        self._b12x_num_q_heads_padded = (
+            self.num_q_heads * self._b12x_head_repeat_factor
+        )
+
         common = dict(
             device=self.device,
             num_q_heads=self.num_q_heads,
@@ -2572,8 +2586,12 @@ class DeepseekSparseAttnBackend(
         self._b12x_mla_plan_decode = plan_decode
         self._b12x_mla_scratch_decode = scratch_decode
 
-        # extend binding (same caps shape; mode label drives split heuristic)
-        caps_extend = B12XSparseMLAScratchCaps(mode="extend", **common)
+        # extend binding. b12x prefill requires heads divisible by HPB=16;
+        # when num_q_heads<16 (e.g. TP8 -> 8 heads) pad to 16 via head repeat.
+        # Decode keeps the real num_q_heads (its kernel supports valid_hpb<16).
+        extend_common = dict(common)
+        extend_common["num_q_heads"] = self._b12x_num_q_heads_padded
+        caps_extend = B12XSparseMLAScratchCaps(mode="extend", **extend_common)
         plan_extend = plan_sparse_mla_scratch(caps_extend)
         scratch_extend = torch.empty(
             plan_extend.layout.nbytes, dtype=torch.uint8, device=self.device
@@ -2657,6 +2675,14 @@ class DeepseekSparseAttnBackend(
         atc = self._b12x_mla_atc_buf[:n_rows]
 
         if is_prefill:
+            # b12x prefill requires heads divisible by HPB=16. When TP-sharded
+            # below 16 (e.g. TP8 -> 8 heads), pad q by repeating heads, run,
+            # then slice the output back to the real head count. MLA absorbed-q
+            # head repeat is math-safe (per-head softmax independence).
+            if self._b12x_need_pad_heads:
+                q = q.repeat_interleave(
+                    self._b12x_head_repeat_factor, dim=1
+                ).contiguous()
             binding = self._b12x_mla_plan_extend.bind(
                 scratch=self._b12x_mla_scratch_extend,
                 q=q,
@@ -2670,6 +2696,8 @@ class DeepseekSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
                 binding=binding,
             )
+            if self._b12x_need_pad_heads:
+                out = out[:, :: self._b12x_head_repeat_factor, :]
         else:
             binding = self._b12x_mla_plan_decode.bind(
                 scratch=self._b12x_mla_scratch_decode,
