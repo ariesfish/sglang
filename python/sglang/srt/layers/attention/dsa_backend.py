@@ -2535,6 +2535,13 @@ class DeepseekSparseAttnBackend(
 
         max_batch = self.req_to_token_pool.size
         max_q_rows = max_batch  # decode: 1 row / request
+        # Extend/prefill q rows = number of prefill tokens in a chunk, not
+        # max_batch. b12x prefill scratch must fit chunked_prefill_size (sglang
+        # chunks long prefills to this), else 'q rows N exceed scratch capacity'.
+        chunked_prefill_size = model_runner.server_args.chunked_prefill_size
+        if chunked_prefill_size is None or chunked_prefill_size <= 0:
+            chunked_prefill_size = max_batch
+        max_q_rows_extend = max(max_batch, int(chunked_prefill_size))
         max_width = self.dsa_index_topk
 
         # b12x prefill kernel requires q heads divisible by HPB=16 (decode
@@ -2591,6 +2598,8 @@ class DeepseekSparseAttnBackend(
         # Decode keeps the real num_q_heads (its kernel supports valid_hpb<16).
         extend_common = dict(common)
         extend_common["num_q_heads"] = self._b12x_num_q_heads_padded
+        # Extend processes chunked_prefill_size tokens at once, not max_batch.
+        extend_common["max_q_rows"] = max_q_rows_extend
         caps_extend = B12XSparseMLAScratchCaps(mode="extend", **extend_common)
         plan_extend = plan_sparse_mla_scratch(caps_extend)
         scratch_extend = torch.empty(
