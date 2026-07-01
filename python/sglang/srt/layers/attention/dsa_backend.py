@@ -2663,6 +2663,20 @@ class DeepseekSparseAttnBackend(
             f"{self.kv_cache_dtype}."
         )
         sel = page_table_1.contiguous()
+        # Diagnostic: b12x uses sel as flat token-slot ids internally
+        # (idx // page_block_size -> block). Catch OOB before the CUDA kernel
+        # asserts asynchronously (which gives an opaque ScatterGather error).
+        # -1 is the invalid sentinel; valid ids must be in [0, kv.shape[0]).
+        if torch.cuda.is_current_stream_capturing():
+            pass  # skip host-side sync during graph capture
+        else:
+            valid = sel[sel >= 0]
+            if valid.numel() > 0:
+                mx = int(valid.max().item())
+                assert mx < kv.shape[0], (
+                    f"b12x selected_indices OOB: max id {mx} >= kv_cache slots"
+                    f" {kv.shape[0]} (page_table_1 range out of bounds)"
+                )
         cache_seqlens = (
             metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
         ).contiguous()
