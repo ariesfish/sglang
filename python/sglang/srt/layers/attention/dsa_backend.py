@@ -2649,7 +2649,12 @@ class DeepseekSparseAttnBackend(
             metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
         ).contiguous()
         n_rows = batch_size
-        atc = self._b12x_mla_atc_buf[:n_rows].fill_(self.dsa_index_topk)
+        # atc (active_token_counts) is a fixed constant = dsa_index_topk for
+        # every row. The buffer is pre-filled with max_width (= dsa_index_topk)
+        # in _ensure_b12x_mla_runtime, so a plain slice view is correct and
+        # avoids an inplace fill_ that is forbidden under InferenceMode during
+        # CUDA graph capture (RuntimeError: Inplace update to inference tensor).
+        atc = self._b12x_mla_atc_buf[:n_rows]
 
         if is_prefill:
             binding = self._b12x_mla_plan_extend.bind(
