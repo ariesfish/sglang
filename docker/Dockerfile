@@ -621,6 +621,8 @@ ARG BUILD_TYPE
 ARG CUDA_VERSION
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
+ARG GRACE_BLACKWELL
+ARG B12X_VERSION=0.23.0
 
 WORKDIR /sgl-workspace
 
@@ -667,6 +669,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && mkdir -p /root/.cache/huggingface /root/.cache/sglang \
     && ( if [ -f python/kernels.lock ]; then mv python/kernels.lock /root/.cache/sglang/; fi ) \
     && ( find /usr/local/lib/python3.12/dist-packages -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true )
+
+# Install b12x (SM120 CuTe DSL kernels) for Grace Blackwell builds.
+# b12x is a pure-Python wheel (py3-none-any); kernels are JIT-compiled at
+# runtime via nvidia-cutlass-dsl. Only needed on SM120 (RTX PRO 6000).
+# Lazily imported by sglang DSA backend + MoE runner behind is_sm120_supported().
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ "$GRACE_BLACKWELL" = "1" ]; then \
+        python3 -m pip install b12x==${B12X_VERSION}; \
+    fi
 
 
 # Install pre-built gateway artifacts from parallel builder

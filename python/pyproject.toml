@@ -95,6 +95,11 @@ default = true
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
 runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.7"]
+# SM120 (RTX PRO 6000 Blackwell) kernels: b12x provides SM120-native sparse MLA,
+# NSA/MSA indexer, and NVFP4 MoE GEMM. Pure-Python wheel; CuTe DSL kernels are
+# JIT-compiled at runtime via nvidia-cutlass-dsl (already a core dep). Only
+# needed on SM120; lazily imported behind is_sm120_supported() checks.
+sm120 = ["b12x==0.23.0"]
 diffusion = [
   "addict==2.4.0",
   "av==16.1.0",

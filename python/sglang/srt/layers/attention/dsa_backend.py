@@ -68,6 +68,33 @@ _IS_GFX95 = is_gfx95_supported()
 if is_cuda():
     import deep_gemm
 
+
+def _build_paged_mqa_schedule(
+    seqlens_2d: torch.Tensor, blocksize: int, sm_count: int
+) -> torch.Tensor:
+    """Dispatch paged-MQA schedule metadata: b12x on SM120, DeepGEMM otherwise.
+
+    Drop-in for ``deep_gemm.get_paged_mqa_logits_metadata``. b12x
+    ``build_paged_mqa_schedule_metadata`` has the same signature and returns the
+    same ``(num_sms+1, 2) int32`` shape, so all 4 call sites in this file are
+    routed through here. Activate when DSA backend is b12x.
+    """
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        backends = {
+            get_global_server_args().dsa_prefill_backend,
+            get_global_server_args().dsa_decode_backend,
+        }
+        if "b12x" in backends:
+            from sglang.srt.layers.attention.dsa.b12x_indexer import (
+                build_b12x_paged_schedule,
+            )
+            return build_b12x_paged_schedule(seqlens_2d, blocksize, sm_count)
+    except Exception:
+        pass
+    return deep_gemm.get_paged_mqa_logits_metadata(seqlens_2d, blocksize, sm_count)
+
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -296,7 +323,7 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
 
 
 _DSA_IMPL_T: TypeAlias = Literal[
-    "flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "trtllm"
+    "flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "trtllm", "aiter", "b12x"
 ]
 
 
@@ -880,7 +907,7 @@ class DeepseekSparseAttnBackend(
             # NOTE: block_kv arg must be 64 here — DG computes SPLIT_KV =
             # block_kv * 4 and both DG's and the indexer's compute kernels
             # require SPLIT_KV = 256; this is independent of the cache page size.
-            paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+            paged_mqa_schedule_metadata = _build_paged_mqa_schedule(
                 paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
             )
 
@@ -1157,7 +1184,7 @@ class DeepseekSparseAttnBackend(
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_mode, cache_seqlens_int32, seqlens_expanded, bs
             )
-            paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+            paged_mqa_schedule_metadata = _build_paged_mqa_schedule(
                 paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
             )
 
@@ -1328,7 +1355,7 @@ class DeepseekSparseAttnBackend(
                 schedule_seqlens_expanded,
                 bs,
             )
-            new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
+            new_schedule = _build_paged_mqa_schedule(
                 seqlens_32_2d, 64, deep_gemm.get_num_sms()
             )
             if metadata.paged_mqa_schedule_metadata is None:
@@ -1528,7 +1555,7 @@ class DeepseekSparseAttnBackend(
                     metadata.dsa_seqlens_expanded,
                     bs,
                 )
-            new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
+            new_schedule = _build_paged_mqa_schedule(
                 seqlens_32_2d, 64, deep_gemm.get_num_sms()
             )
             if metadata.paged_mqa_schedule_metadata is None:
@@ -1590,6 +1617,25 @@ class DeepseekSparseAttnBackend(
                 is_neox,
                 llama_4_scaling,
                 is_prefill=True,
+            )
+
+        if dsa_impl == "b12x" and not self.use_mha:
+            # b12x path: save kv cache first (same as trtllm), then dispatch to MLA.
+            # _forward_b12x_mla only needs q_all + kv_cache + page_table_1, so we
+            # replicate the minimal save-kv + q-assembly prefix from _forward_trtllm.
+            return self._forward_b12x_extend(
+                q=q,
+                k=k,
+                v=v,
+                layer=layer,
+                forward_batch=forward_batch,
+                metadata=metadata,
+                save_kv_cache=save_kv_cache,
+                q_rope=q_rope,
+                k_rope=k_rope,
+                topk_indices=topk_indices,
+                cos_sin_cache=cos_sin_cache,
+                is_neox=is_neox,
             )
 
         if k is not None:
@@ -1932,6 +1978,17 @@ class DeepseekSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 bs=forward_batch.batch_size,
+            )
+        elif self.dsa_decode_impl == "b12x":
+            if q_rope is not None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            return self._forward_b12x_mla(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                layer=layer,
+                metadata=metadata,
+                is_prefill=False,
             )
 
         else:
@@ -2459,6 +2516,221 @@ class DeepseekSparseAttnBackend(
         )
 
         return out
+
+    def _ensure_b12x_mla_runtime(self) -> None:
+        """Lazily build b12x sparse MLA plan + scratch buffers (graph-safe).
+
+        Mirrors the sglang workspace pattern: plan + scratch tensor are allocated
+        ONCE in __init__-equivalent timing and reused across forwards. plan.bind()
+        returns a fresh per-call binding of views into the fixed scratch storage,
+        which is CUDA-graph-capturable (no alloc / no init at bind time).
+        """
+        if getattr(self, "_b12x_mla_ready", False):
+            return
+
+        from b12x.integration.sparse_mla_scratch import (
+            B12XSparseMLAScratchCaps,
+            plan_sparse_mla_scratch,
+        )
+
+        max_batch = self.req_to_token_pool.size
+        max_q_rows = max_batch  # decode: 1 row / request
+        max_width = self.dsa_index_topk
+
+        common = dict(
+            device=self.device,
+            num_q_heads=self.num_q_heads,
+            max_q_rows=max_q_rows,
+            max_width=max_width,
+            dtype=torch.bfloat16,
+            kv_dtype=torch.uint8,  # GLM 656 packed bytes
+            head_dim=self.qk_nope_head_dim + self.qk_rope_head_dim,
+            v_head_dim=self.kv_lora_rank,
+            max_batch=max_batch,
+            max_chunks_per_row=64,
+            page_size=self.real_page_size,
+        )
+        # decode / verify / draft_extend binding
+        caps_decode = B12XSparseMLAScratchCaps(mode="decode", **common)
+        plan_decode = plan_sparse_mla_scratch(caps_decode)
+        scratch_decode = torch.empty(
+            plan_decode.layout.nbytes, dtype=torch.uint8, device=self.device
+        )
+        self._b12x_mla_plan_decode = plan_decode
+        self._b12x_mla_scratch_decode = scratch_decode
+
+        # extend binding (same caps shape; mode label drives split heuristic)
+        caps_extend = B12XSparseMLAScratchCaps(mode="extend", **common)
+        plan_extend = plan_sparse_mla_scratch(caps_extend)
+        scratch_extend = torch.empty(
+            plan_extend.layout.nbytes, dtype=torch.uint8, device=self.device
+        )
+        self._b12x_mla_plan_extend = plan_extend
+        self._b12x_mla_scratch_extend = scratch_extend
+
+        self._b12x_mla_atc_buf = torch.full(
+            (max_batch,), max_width, dtype=torch.int32, device=self.device
+        )
+        self._b12x_mla_ready = True
+
+    def _forward_b12x_mla(
+        self,
+        *,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        layer: RadixAttention,
+        metadata,
+        is_prefill: bool,
+        seq_lens: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """b12x SM120 sparse MLA decode/verify path.
+
+        Contract verified by .scratch/test_b12x_mla_contract.py:
+        - page_table_1 (sglang transform_index_page_table_decode output) feeds
+          b12x selected_indices directly: both are kv_cache-dim-0 absolute
+          token slot indices with -1 sentinel.
+        - active_token_counts = width (= dsa_index_topk); -1 sentinel filters
+          invalid slots (proven by counterexample: cannot use 'valid count').
+        - kv_cache 656-byte packed layout matches sglang dsa_kv_cache_store_fp8.
+        """
+        from b12x.integration.mla import (
+            sparse_mla_decode_forward,
+            sparse_mla_extend_forward,
+        )
+
+        self._ensure_b12x_mla_runtime()
+
+        q_scale = 1.0
+        k_scale = (
+            layer.k_scale_float
+            if getattr(layer, "k_scale_float", None) is not None
+            else 1.0
+        )
+        sm_scale = q_scale * k_scale * layer.scaling
+
+        batch_size = page_table_1.shape[0]
+        q = q_all.reshape(batch_size, layer.tp_q_head_num, q_all.shape[-1]).contiguous()
+        # b12x expects kv_cache as [num_tokens, 1, kv_cache_dim] uint8.
+        kv = kv_cache.view(-1, 1, self.kv_cache_dim).contiguous()
+        sel = page_table_1.contiguous()
+        cache_seqlens = (
+            metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
+        ).contiguous()
+        n_rows = batch_size
+        atc = self._b12x_mla_atc_buf[:n_rows].fill_(self.dsa_index_topk)
+
+        if is_prefill:
+            binding = self._b12x_mla_plan_extend.bind(
+                scratch=self._b12x_mla_scratch_extend,
+                q=q,
+                selected_indices=sel,
+                cache_seqlens_int32=cache_seqlens,
+                nsa_cache_seqlens_int32=atc,
+            )
+            out = sparse_mla_extend_forward(
+                kv_cache=kv,
+                sm_scale=sm_scale,
+                v_head_dim=layer.v_head_dim,
+                binding=binding,
+            )
+        else:
+            binding = self._b12x_mla_plan_decode.bind(
+                scratch=self._b12x_mla_scratch_decode,
+                q=q,
+                selected_indices=sel,
+                cache_seqlens_int32=cache_seqlens,
+                nsa_cache_seqlens_int32=atc,
+            )
+            out = sparse_mla_decode_forward(
+                kv_cache=kv,
+                sm_scale=sm_scale,
+                v_head_dim=layer.v_head_dim,
+                binding=binding,
+            )
+        return out
+
+    def _forward_b12x_extend(
+        self,
+        *,
+        q,
+        k,
+        v,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        metadata,
+        save_kv_cache=True,
+        q_rope=None,
+        k_rope=None,
+        topk_indices=None,
+        cos_sin_cache=None,
+        is_neox=False,
+    ) -> torch.Tensor:
+        """b12x SM120 sparse MLA prefill/extend path.
+
+        Reuses _forward_trtllm's save-kv + q_all assembly + page_table_1 transform
+        prefix, then dispatches to _forward_b12x_mla(is_prefill=True).
+        """
+        merge_query = q_rope is not None
+        if self.kv_cache_dtype == torch.float8_e4m3fn:
+            assert q_rope is not None, "For FP8 path q_rope should not be None."
+            assert k_rope is not None, "For FP8 path k_rope should not be None."
+            assert (
+                cos_sin_cache is not None
+            ), "For FP8 path cos_sin_cache should not be None."
+            q, k, k_rope = mla_quantize_and_rope_for_fp8(
+                q,
+                q_rope,
+                k.squeeze(1),
+                k_rope.squeeze(1),
+                forward_batch.positions,
+                cos_sin_cache,
+                is_neox,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
+            )
+            merge_query = False
+
+        if save_kv_cache:
+            assert k is not None and k_rope is not None
+            cache_loc = (
+                forward_batch.out_cache_loc
+                if not layer.is_cross_attention
+                else forward_batch.encoder_out_cache_loc
+            )
+            self.token_to_kv_pool.set_mla_kv_buffer(layer, cache_loc, k, k_rope)
+
+        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_cache = k_cache.view(-1, self.real_page_size, self.kv_cache_dim)
+
+        if merge_query:
+            q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            q_rope_reshaped = q_rope.view(
+                -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+            )
+            q_all = concat_mla_absorb_q_general(q_nope, q_rope_reshaped)
+        else:
+            q_all = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+
+        if topk_indices is not None:
+            topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
+
+        page_table_1 = transform_index_page_table_prefill(
+            page_table=metadata.page_table_1,
+            topk_indices=topk_indices,
+            extend_lens_cpu=metadata.dsa_extend_seq_lens_list,
+            page_size=1,
+        )
+
+        return self._forward_b12x_mla(
+            q_all=q_all,
+            kv_cache=kv_cache,
+            page_table_1=page_table_1,
+            layer=layer,
+            metadata=metadata,
+            is_prefill=True,
+            seq_lens=metadata.dsa_cache_seqlens_int32,
+        )
 
     def _pad_topk_indices(
         self, topk_indices: torch.Tensor, num_tokens: int

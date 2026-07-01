@@ -63,6 +63,25 @@ _is_gfx95_supported = is_gfx95_supported()
 # KVBlockSize=64) can be used. Falls back to the legacy page_size=1 / KVBlockSize=1
 # path when the gluon kernel is unavailable (Triton<3.5 and no AOT bundle).
 _use_aiter_preshuffle = aiter_can_use_preshuffle_paged_mqa()
+
+
+def _use_b12x_indexer() -> bool:
+    """Whether the b12x paged indexer should replace DeepGEMM.
+
+    Activated when the DSA prefill or decode backend is ``b12x`` (SM120 path).
+    Reads the global server_args at call time so it picks up the resolved
+    backend after ``_set_default_dsa_backends``.
+    """
+    if not _is_cuda:
+        return False
+    try:
+        server_args = get_global_server_args()
+    except Exception:
+        return False
+    backends = {server_args.dsa_prefill_backend, server_args.dsa_decode_backend}
+    return "b12x" in backends
+
+
 if _use_aiter and not _use_aiter_preshuffle:
     logger.warning(
         "ROCm DSA indexer: aiter preshuffle paged-MQA path is unavailable "
@@ -853,6 +872,48 @@ class Indexer(MultiPlatformOp):
             seqlens_32_2d = seqlens_32
         else:
             seqlens_32_2d = seqlens_32.unsqueeze(-1)
+
+        if _use_b12x_indexer():
+            # b12x paged indexer (SM120): replaces DeepGEMM fp8_paged_mqa_logits.
+            # Produces the same (q_rows, width_tokens) float32 logits shape that
+            # topk_transform below expects. K-cache byte layout is identical
+            # (verified by .scratch/test_b12x_mla_contract.py).
+            from sglang.srt.layers.attention.dsa.b12x_indexer import (
+                B12xIndexerRunner,
+            )
+            if not hasattr(self, "_b12x_indexer_runner"):
+                self._b12x_indexer_runner = B12xIndexerRunner(
+                    sm_count=self.sm_count, index_topk=self.index_topk
+                )
+            # b12x expects index_k_cache as 2D uint8 (N, page_size*(128+4));
+            # sglang kv_cache_fp8 is the raw buffer before the (N,64,1,132) view.
+            q_fp8_b12x = q_fp8.unsqueeze(1) if q_fp8.ndim == 2 else q_fp8
+            weights_b12x = weights.squeeze(2) if weights.ndim == 3 else weights
+            logits = self._b12x_indexer_runner.get_paged_decode_logits(
+                q_fp8=q_fp8_b12x,
+                weights=weights_b12x,
+                index_k_cache=kv_cache_fp8,
+                real_page_table=block_tables,
+                cache_seqlens_int32=seqlens_32_2d.squeeze(-1)
+                if seqlens_32_2d.dim() == 2 and seqlens_32_2d.shape[1] == 1
+                else seqlens_32_2d,
+                schedule_metadata=schedule_metadata,
+                page_size=page_size,
+                q_offset=q_offset,
+            )
+            topk_result = metadata.topk_transform(logits, self.index_topk)
+            # Restore possible padding in the hidden states (same as DeepGEMM path).
+            if q_offset < q_fp8.shape[0]:
+                pad_len = q_fp8.shape[0] - q_offset
+                padding = torch.full(
+                    (pad_len, topk_result.shape[1]),
+                    -1,
+                    dtype=topk_result.dtype,
+                    device=topk_result.device,
+                )
+                topk_result = torch.cat([topk_result, padding], dim=0)
+            return topk_result
+
         if _is_cuda:
             if schedule_metadata is None:
                 schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
@@ -1090,6 +1151,21 @@ class Indexer(MultiPlatformOp):
                         ke,
                         clean_logits=False,
                     )
+                elif _use_b12x_indexer():
+                    from sglang.srt.layers.attention.dsa.b12x_indexer import (
+                        B12xIndexerRunner,
+                    )
+                    if not hasattr(self, "_b12x_indexer_runner"):
+                        self._b12x_indexer_runner = B12xIndexerRunner(
+                            sm_count=self.sm_count, index_topk=self.index_topk
+                        )
+                    logits = self._b12x_indexer_runner.get_contiguous_logits(
+                        q_fp8=q_fp8[:q_offset],
+                        weights=weights[:q_offset],
+                        kv_fp8=kv_fp8,
+                        ks=ks,
+                        ke=ke,
+                    )
                 else:
                     logits = deep_gemm.fp8_mqa_logits(
                         q_fp8[:q_offset],
@@ -1141,6 +1217,21 @@ class Indexer(MultiPlatformOp):
                         ks[start:end],
                         ke[start:end],
                         clean_logits=False,
+                    )
+                elif _use_b12x_indexer():
+                    if not hasattr(self, "_b12x_indexer_runner"):
+                        from sglang.srt.layers.attention.dsa.b12x_indexer import (
+                            B12xIndexerRunner,
+                        )
+                        self._b12x_indexer_runner = B12xIndexerRunner(
+                            sm_count=self.sm_count, index_topk=self.index_topk
+                        )
+                    logits_chunk = self._b12x_indexer_runner.get_contiguous_logits(
+                        q_fp8=q_fp8[start:end],
+                        weights=weights[start:end],
+                        kv_fp8=kv_fp8,
+                        ks=ks[start:end],
+                        ke=ke[start:end],
                     )
                 else:
                     logits_chunk = deep_gemm.fp8_mqa_logits(
@@ -1349,14 +1440,30 @@ class Indexer(MultiPlatformOp):
             ke = ks + ke_offset
             actual_seq_q = torch.cat(actual_seq_q_list, dim=0)
             with self._with_real_sm_count():
-                logits = deep_gemm.fp8_mqa_logits(
-                    q_fp8,
-                    kv_fp8,
-                    weights,
-                    ks,
-                    ke,
-                    clean_logits=False,
-                )
+                if _use_b12x_indexer():
+                    if not hasattr(self, "_b12x_indexer_runner"):
+                        from sglang.srt.layers.attention.dsa.b12x_indexer import (
+                            B12xIndexerRunner,
+                        )
+                        self._b12x_indexer_runner = B12xIndexerRunner(
+                            sm_count=self.sm_count, index_topk=self.index_topk
+                        )
+                    logits = self._b12x_indexer_runner.get_contiguous_logits(
+                        q_fp8=q_fp8,
+                        weights=weights,
+                        kv_fp8=kv_fp8,
+                        ks=ks,
+                        ke=ke,
+                    )
+                else:
+                    logits = deep_gemm.fp8_mqa_logits(
+                        q_fp8,
+                        kv_fp8,
+                        weights,
+                        ks,
+                        ke,
+                        clean_logits=False,
+                    )
             topk_result = metadata.topk_transform(
                 logits,
                 self.index_topk,
@@ -1395,14 +1502,30 @@ class Indexer(MultiPlatformOp):
             ke = ks + ke_offset
 
             with self._with_real_sm_count():
-                logits = deep_gemm.fp8_mqa_logits(
-                    q_fp8,
-                    kv_fp8,
-                    weights,
-                    ks,
-                    ke,
-                    clean_logits=False,
-                )
+                if _use_b12x_indexer():
+                    if not hasattr(self, "_b12x_indexer_runner"):
+                        from sglang.srt.layers.attention.dsa.b12x_indexer import (
+                            B12xIndexerRunner,
+                        )
+                        self._b12x_indexer_runner = B12xIndexerRunner(
+                            sm_count=self.sm_count, index_topk=self.index_topk
+                        )
+                    logits = self._b12x_indexer_runner.get_contiguous_logits(
+                        q_fp8=q_fp8,
+                        weights=weights,
+                        kv_fp8=kv_fp8,
+                        ks=ks,
+                        ke=ke,
+                    )
+                else:
+                    logits = deep_gemm.fp8_mqa_logits(
+                        q_fp8,
+                        kv_fp8,
+                        weights,
+                        ks,
+                        ke,
+                        clean_logits=False,
+                    )
             actual_seq_q = torch.tensor([actual_seq_q], dtype=torch.int32).to(
                 device="cuda", non_blocking=True
             )
