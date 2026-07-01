@@ -823,6 +823,15 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
 # Copy Python site-packages from framework (already cleaned of __pycache__/tests/pyc files)
 COPY --from=framework_final /usr/local/lib/python3.12/dist-packages /usr/local/lib/python3.12/dist-packages
 
+# Belt-and-suspenders: install distro directly in the FINAL runtime stage.
+# framework_final installs distro too, but it occasionally fails to propagate
+# through the COPY dist-packages (constraints/cache layer interference),
+# causing 'ModuleNotFoundError: No module named distro' at sglang import
+# (openai==2.6.1 hard-deps distro). Installing here is authoritative: the
+# runtime stage is a fresh base with no constraints.txt, so this always lands
+# in the dist-packages the container actually runs with.
+RUN python3 -m pip install --no-input distro
+
 # Copy SGLang workspace
 COPY --from=framework_final /sgl-workspace /sgl-workspace
 
