@@ -2543,7 +2543,14 @@ class DeepseekSparseAttnBackend(
             max_q_rows=max_q_rows,
             max_width=max_width,
             dtype=torch.bfloat16,
-            kv_dtype=torch.uint8,  # GLM 656 packed bytes
+            # Match the actual KV cache dtype, NOT a hardcoded uint8. sglang
+            # allocates GLM NVFP4 KV cache as torch.float8_e4m3fn (1 byte/elem,
+            # 656-byte packed last dim == 656 fp8 elems). b12x strictly checks
+            # kv_cache.dtype == workspace.kv_dtype. uint8 only matches when the
+            # pool stores raw bytes; fp8 path stores float8_e4m3fn.
+            kv_dtype=self.kv_cache_dtype
+            if self.kv_cache_dtype is not None
+            else torch.bfloat16,
             # Absorb path passes the ABSORBED q (q_nope already projected into
             # the kv_lora_rank latent space via W_UK^T), concatenated with the
             # rope part. So the q head_dim seen by b12x is
@@ -2626,8 +2633,17 @@ class DeepseekSparseAttnBackend(
             f" + qk_rope_head_dim({self.qk_rope_head_dim}) = {expected_q_head_dim},"
             f" got {q.shape[-1]}. The absorb path must pass the latent-space q."
         )
-        # b12x expects kv_cache as [num_tokens, 1, kv_cache_dim] uint8.
+        # b12x expects kv_cache as [num_tokens, 1, kv_cache_dim] with dtype
+        # matching the scratch kv_dtype (fp8_e4m3fn for GLM NVFP4).
         kv = kv_cache.view(-1, 1, self.kv_cache_dim).contiguous()
+        expected_kv_dtype = (
+            self.kv_cache_dtype if self.kv_cache_dtype is not None else torch.bfloat16
+        )
+        assert kv.dtype == expected_kv_dtype, (
+            f"b12x scratch kv_dtype {expected_kv_dtype} does not match kv_cache"
+            f" dtype {kv.dtype}; scratch was built with kv_cache_dtype="
+            f"{self.kv_cache_dtype}."
+        )
         sel = page_table_1.contiguous()
         cache_seqlens = (
             metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
