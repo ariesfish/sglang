@@ -674,9 +674,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # b12x is a pure-Python wheel (py3-none-any); kernels are JIT-compiled at
 # runtime via nvidia-cutlass-dsl. Only needed on SM120 (RTX PRO 6000).
 # Lazily imported by sglang DSA backend + MoE runner behind is_sm120_supported().
+# --no-deps: b12x declares torch>=2.12.0 which would upgrade sglang's pinned
+# torch==2.11.0 and break the torch/torchvision ABI. sglang already covers
+# b12x's runtime deps (cutlass-dsl[cu13], tvm-ffi, cuda-python, transformers).
 RUN --mount=type=cache,target=/root/.cache/pip \
     if [ "$GRACE_BLACKWELL" = "1" ]; then \
-        python3 -m pip install b12x==${B12X_VERSION}; \
+        python3 -m pip install --no-deps b12x==${B12X_VERSION}; \
     fi
 
 
