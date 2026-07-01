@@ -677,8 +677,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # --no-deps: b12x declares torch>=2.12.0 which would upgrade sglang's pinned
 # torch==2.11.0 and break the torch/torchvision ABI. sglang already covers
 # b12x's runtime deps (cutlass-dsl[cu13], tvm-ffi, cuda-python, transformers).
+# Also ensure distro is present: openai==2.6.1 declares it as a hard dep but
+# pip occasionally fails to resolve it under the CUDA 13 constraints stack.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    if [ "$GRACE_BLACKWELL" = "1" ]; then \
+    python3 -m pip install distro \
+    && if [ "$GRACE_BLACKWELL" = "1" ]; then \
         python3 -m pip install --no-deps b12x==${B12X_VERSION}; \
     fi
 
