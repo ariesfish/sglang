@@ -961,9 +961,16 @@ class DeepseekMLAForwardMixin:
         Check if we should skip rope and do fused rope+quantize for TRTLLM MLA decode in fp8_e4m3 path.
         """
         if self.current_attention_backend in ("dsa", "nsa"):
+            # b12x shares trtllm's FP8 fused rope+quantize path
+            # (_forward_b12x_extend calls mla_quantize_and_rope_for_fp8, which
+            # needs cos_sin_cache). On SM120, dsa_prefill/decode_backend defaults
+            # to "b12x", so without this the FP8 extend assert
+            # ("cos_sin_cache should not be None") fires during prefill CUDA
+            # graph capture.
+            sa = get_global_server_args()
             return (
-                get_global_server_args().dsa_decode_backend == "trtllm"
-                or get_global_server_args().dsa_prefill_backend == "trtllm"
+                sa.dsa_decode_backend in ("trtllm", "b12x")
+                or sa.dsa_prefill_backend in ("trtllm", "b12x")
             ) and get_attn_backend().kv_cache_dtype == torch.float8_e4m3fn
 
         return (
