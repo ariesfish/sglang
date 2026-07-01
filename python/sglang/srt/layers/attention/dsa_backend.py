@@ -2704,28 +2704,24 @@ class DeepseekSparseAttnBackend(
     ) -> torch.Tensor:
         """b12x SM120 sparse MLA prefill/extend path.
 
-        Reuses _forward_trtllm's save-kv + q_all assembly + page_table_1 transform
-        prefix, then dispatches to _forward_b12x_mla(is_prefill=True).
+        b12x expects a BF16 absorbed q (q_nope projected into kv_lora_rank
+        latent space, concatenated with the rope part) with rope ALREADY
+        applied in forward_absorb_prepare. This mirrors the decode path
+        (concat_mla_absorb_q_general). Do NOT call mla_quantize_and_rope_for_fp8
+        here: that is the trtllm contract (trtllm takes a pre-quantized fp8 q
+        and applies rope inside its fused kernel); b12x self-quantizes bf16 q
+        to fp8 inside its kernel (see b12x decode_math S0 "BF16 Q -> E4M3").
+        KV cache FP8 packing is handled by set_mla_kv_buffer (dsa_kv_cache_store_fp8
+        -> quantize_k_cache_separate), independent of the q path.
         """
-        merge_query = q_rope is not None
-        if self.kv_cache_dtype == torch.float8_e4m3fn:
-            assert q_rope is not None, "For FP8 path q_rope should not be None."
-            assert k_rope is not None, "For FP8 path k_rope should not be None."
-            assert (
-                cos_sin_cache is not None
-            ), "For FP8 path cos_sin_cache should not be None."
-            q, k, k_rope = mla_quantize_and_rope_for_fp8(
-                q,
-                q_rope,
-                k.squeeze(1),
-                k_rope.squeeze(1),
-                forward_batch.positions,
-                cos_sin_cache,
-                is_neox,
-                self.kv_lora_rank,
-                self.qk_rope_head_dim,
+        if q_rope is not None:
+            q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            q_rope_reshaped = q_rope.view(
+                -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
             )
-            merge_query = False
+            q_all = concat_mla_absorb_q_general(q_nope, q_rope_reshaped)
+        else:
+            q_all = q.view(-1, layer.tp_q_head_num, layer.head_dim)
 
         if save_kv_cache:
             assert k is not None and k_rope is not None
@@ -2734,19 +2730,12 @@ class DeepseekSparseAttnBackend(
                 if not layer.is_cross_attention
                 else forward_batch.encoder_out_cache_loc
             )
+            # set_mla_kv_buffer internally quantizes bf16 k_nope/k_rope into the
+            # FP8 656-byte packed layout when dsa_kv_cache_store_fp8 is set.
             self.token_to_kv_pool.set_mla_kv_buffer(layer, cache_loc, k, k_rope)
 
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         kv_cache = k_cache.view(-1, self.real_page_size, self.kv_cache_dim)
-
-        if merge_query:
-            q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-            q_rope_reshaped = q_rope.view(
-                -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
-            )
-            q_all = concat_mla_absorb_q_general(q_nope, q_rope_reshaped)
-        else:
-            q_all = q.view(-1, layer.tp_q_head_num, layer.head_dim)
 
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
