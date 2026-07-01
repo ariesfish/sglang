@@ -2663,20 +2663,6 @@ class DeepseekSparseAttnBackend(
             f"{self.kv_cache_dtype}."
         )
         sel = page_table_1.contiguous()
-        # Diagnostic: b12x uses sel as flat token-slot ids internally
-        # (idx // page_block_size -> block). Catch OOB before the CUDA kernel
-        # asserts asynchronously (which gives an opaque ScatterGather error).
-        # -1 is the invalid sentinel; valid ids must be in [0, kv.shape[0]).
-        if torch.cuda.is_current_stream_capturing():
-            pass  # skip host-side sync during graph capture
-        else:
-            valid = sel[sel >= 0]
-            if valid.numel() > 0:
-                mx = int(valid.max().item())
-                assert mx < kv.shape[0], (
-                    f"b12x selected_indices OOB: max id {mx} >= kv_cache slots"
-                    f" {kv.shape[0]} (page_table_1 range out of bounds)"
-                )
         cache_seqlens = (
             metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
         ).contiguous()
@@ -2782,28 +2768,22 @@ class DeepseekSparseAttnBackend(
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
 
-        # Diagnostic: topk_indices are per-request token positions used to
-        # gather into page_table[bs, max_seqlen_k]. Any value >= max_seqlen_k
-        # (and >=0) makes torch.gather OOB. Confirm the indexer output range
-        # before the gather fires asynchronously.
-        if topk_indices is not None and not torch.cuda.is_current_stream_capturing():
-            pt = metadata.page_table_1
-            mx_seq = int(pt.shape[1])
-            valid = topk_indices[topk_indices >= 0]
-            if valid.numel() > 0:
-                mx = int(valid.max().item())
-                assert mx < mx_seq, (
-                    f"b12x prefill topk_indices OOB: max index {mx} >= "
-                    f"page_table max_seqlen_k {mx_seq} (indexer returned a "
-                    f"token position past the request KV length)"
-                )
-
-        page_table_1 = transform_index_page_table_prefill(
-            page_table=metadata.page_table_1,
-            topk_indices=topk_indices,
-            extend_lens_cpu=metadata.dsa_extend_seq_lens_list,
-            page_size=1,
-        )
+        # Mirror trtllm's topk dispatch: SGLANG_DSA_FUSE_TOPK (default True)
+        # means the topk kernel already fused the page_table_1 transform, so
+        # topk_indices IS page_table_1. Only the non-fused path calls
+        # transform_index_page_table_prefill (whose torch.gather has no upper-
+        # bound clamp and OOBs when topk_indices carries positions >=
+        # max_seqlen_k). trtllm prefill runs fine precisely because it takes
+        # this fused branch; b12x must match.
+        if envs.SGLANG_DSA_FUSE_TOPK.get():
+            page_table_1 = self._get_fused_topk_page_table(topk_indices)
+        else:
+            page_table_1 = transform_index_page_table_prefill(
+                page_table=metadata.page_table_1,
+                topk_indices=topk_indices,
+                extend_lens_cpu=metadata.dsa_extend_seq_lens_list,
+                page_size=1,
+            )
 
         return self._forward_b12x_mla(
             q_all=q_all,
