@@ -2601,7 +2601,10 @@ class DeepseekSparseAttnBackend(
         extend_common = dict(common)
         extend_common["num_q_heads"] = self._b12x_num_q_heads_padded
         # Extend processes chunked_prefill_size tokens at once, not max_batch.
+        # b12x prefill passes per-token cache_seqlens (rows == q rows), so both
+        # max_q_rows and max_batch (cache_seqlens capacity) must fit a full chunk.
         extend_common["max_q_rows"] = max_q_rows_extend
+        extend_common["max_batch"] = max_q_rows_extend
         caps_extend = B12XSparseMLAScratchCaps(mode="extend", **extend_common)
         plan_extend = plan_sparse_mla_scratch(caps_extend)
         scratch_extend = torch.empty(
