@@ -2544,7 +2544,13 @@ class DeepseekSparseAttnBackend(
             max_width=max_width,
             dtype=torch.bfloat16,
             kv_dtype=torch.uint8,  # GLM 656 packed bytes
-            head_dim=self.qk_nope_head_dim + self.qk_rope_head_dim,
+            # Absorb path passes the ABSORBED q (q_nope already projected into
+            # the kv_lora_rank latent space via W_UK^T), concatenated with the
+            # rope part. So the q head_dim seen by b12x is
+            # kv_lora_rank + qk_rope_head_dim, NOT qk_nope + qk_rope. b12x's
+            # binding receives no W_UK weights and cannot self-absorb. For GLM
+            # qk_nope(192) != kv_lora_rank(512), so the two formulas differ.
+            head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
             v_head_dim=self.kv_lora_rank,
             max_batch=max_batch,
             max_chunks_per_row=64,
@@ -2611,6 +2617,15 @@ class DeepseekSparseAttnBackend(
 
         batch_size = page_table_1.shape[0]
         q = q_all.reshape(batch_size, layer.tp_q_head_num, q_all.shape[-1]).contiguous()
+        # Absorb path yields q head_dim = kv_lora_rank + qk_rope_head_dim. Guard
+        # explicitly: b12x's generic "head_dim does not match scratch" error does
+        # not explain the absorb/latent-space distinction.
+        expected_q_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        assert q.shape[-1] == expected_q_head_dim, (
+            f"b12x expects absorbed q head_dim = kv_lora_rank({self.kv_lora_rank})"
+            f" + qk_rope_head_dim({self.qk_rope_head_dim}) = {expected_q_head_dim},"
+            f" got {q.shape[-1]}. The absorb path must pass the latent-space q."
+        )
         # b12x expects kv_cache as [num_tokens, 1, kv_cache_dim] uint8.
         kv = kv_cache.view(-1, 1, self.kv_cache_dim).contiguous()
         sel = page_table_1.contiguous()
