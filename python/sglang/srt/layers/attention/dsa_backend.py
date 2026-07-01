@@ -2782,6 +2782,22 @@ class DeepseekSparseAttnBackend(
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
 
+        # Diagnostic: topk_indices are per-request token positions used to
+        # gather into page_table[bs, max_seqlen_k]. Any value >= max_seqlen_k
+        # (and >=0) makes torch.gather OOB. Confirm the indexer output range
+        # before the gather fires asynchronously.
+        if topk_indices is not None and not torch.cuda.is_current_stream_capturing():
+            pt = metadata.page_table_1
+            mx_seq = int(pt.shape[1])
+            valid = topk_indices[topk_indices >= 0]
+            if valid.numel() > 0:
+                mx = int(valid.max().item())
+                assert mx < mx_seq, (
+                    f"b12x prefill topk_indices OOB: max index {mx} >= "
+                    f"page_table max_seqlen_k {mx_seq} (indexer returned a "
+                    f"token position past the request KV length)"
+                )
+
         page_table_1 = transform_index_page_table_prefill(
             page_table=metadata.page_table_1,
             topk_indices=topk_indices,
