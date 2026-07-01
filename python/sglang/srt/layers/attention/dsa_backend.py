@@ -2613,8 +2613,12 @@ class DeepseekSparseAttnBackend(
         self._b12x_mla_plan_extend = plan_extend
         self._b12x_mla_scratch_extend = scratch_extend
 
+        # atc (active_token_counts) buffer is shared by decode and extend.
+        # Prefill passes per-token nsa_cache_seqlens (rows == q rows == up to
+        # chunked_prefill_size), so the buffer must fit max_q_rows_extend, not
+        # just max_batch. decode's n_rows (<= max_batch) slices safely below.
         self._b12x_mla_atc_buf = torch.full(
-            (max_batch,), max_width, dtype=torch.int32, device=self.device
+            (max_q_rows_extend,), max_width, dtype=torch.int32, device=self.device
         )
         self._b12x_mla_ready = True
 
