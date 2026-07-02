@@ -28,6 +28,7 @@ GLM vs DSV4:
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -36,6 +37,14 @@ if TYPE_CHECKING:
     pass
 
 logger = logging.getLogger(__name__)
+
+# b12x TMA-based contiguous logits kernel tiles k_quant in blocks of 256
+# rows with OOB_FILL_NONE. When k_quant rows is not a multiple of 256
+# (common with variable-length real requests), OOB TMA loads return garbage
+# that the kernel uses for downstream address computation, causing
+# CUDA_ERROR_MISALIGNED_ADDRESS. The benchmark avoids this because fixed
+# input lengths (2048, 8192) are always multiples of 256.
+_B12X_CONTIGUOUS_TMA_BLOCK_K = 256
 
 # Re-export for convenience so callers can import everything from one place.
 from b12x.attention.indexer import (  # noqa: E402
@@ -46,6 +55,13 @@ from b12x.attention.indexer import (  # noqa: E402
     prepare_paged_indexer_metadata,
     build_paged_mqa_schedule_metadata,
 )
+
+try:
+    from b12x.attention.indexer.reference import (  # noqa: E402
+        contiguous_logits_reference,
+    )
+except ImportError:
+    contiguous_logits_reference = None
 
 
 class B12xIndexerRunner:
@@ -152,18 +168,65 @@ class B12xIndexerRunner:
           kv_fp8 = (k_quant [K,128] float8_e4m3fn, k_scale [K] float32) tuple,
           identical to the DeepGEMM kv_fp8 tuple sglang builds.
         """
+        k_quant, k_scale = kv_fp8
+        k_rows = k_quant.shape[0]
+
+        # b12x TMA-based contiguous kernel uses OOB_FILL_NONE: when k_rows is
+        # not a multiple of the TMA tile size (256), OOB TMA loads return
+        # garbage that the kernel uses for subsequent address calculations,
+        # causing CUDA_ERROR_MISALIGNED_ADDRESS on variable-length real requests
+        # (the benchmark's fixed 2048/8192 lengths are always 256-aligned and
+        # thus never triggered this). Pad k_quant/k_scale to the next multiple
+        # of 256 so TMA never reads OOB. The extra rows are never referenced
+        # because ks/ke clamp to the real k_rows.
+        pad_rows = (-k_rows) % _B12X_CONTIGUOUS_TMA_BLOCK_K
+        if pad_rows > 0:
+            k_quant = torch.cat(
+                [k_quant, k_quant.new_zeros((pad_rows,) + k_quant.shape[1:])],
+                dim=0,
+            )
+            k_scale = torch.cat(
+                [k_scale, k_scale.new_zeros((pad_rows,) + k_scale.shape[1:])],
+                dim=0,
+            )
+
+        kv_fp8_padded = (k_quant, k_scale)
+
         metadata = IndexerContiguousMetadata(
             k_start=ks.to(torch.int32).contiguous(),
             k_end=ke.to(torch.int32).contiguous(),
         )
-        logits = contiguous_logits(
-            q_fp8=q_fp8,
-            weights=weights,
-            kv_fp8=kv_fp8,
-            metadata=metadata,
-            score_mode=0,  # IndexerScoreMode.NSA_RELU_SUM (GLM-5.2)
-        )
-        return logits
+
+        # Env-var escape hatch: force the (slower, non-TMA) reference path if
+        # the TMA kernel still misbehaves after padding.
+        if os.environ.get("SGLANG_B12X_INDEXER_FORCE_REFERENCE", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+        ):
+            if contiguous_logits_reference is None:
+                raise ImportError(
+                    "SGLANG_B12X_INDEXER_FORCE_REFERENCE=1 but "
+                    "b12x.attention.indexer.reference is not available"
+                )
+            logits = contiguous_logits_reference(
+                q_fp8=q_fp8,
+                weights=weights,
+                kv_fp8=kv_fp8_padded,
+                k_start=metadata.k_start,
+                k_end=metadata.k_end,
+            )
+        else:
+            logits = contiguous_logits(
+                q_fp8=q_fp8,
+                weights=weights,
+                kv_fp8=kv_fp8_padded,
+                metadata=metadata,
+                score_mode=0,  # IndexerScoreMode.NSA_RELU_SUM (GLM-5.2)
+            )
+        # Slice logits columns back to the real k_rows (padding added extra
+        # columns that the caller does not expect).
+        return logits[:, :k_rows]
 
 
 def build_b12x_paged_schedule(
