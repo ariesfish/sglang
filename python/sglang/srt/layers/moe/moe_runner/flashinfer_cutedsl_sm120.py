@@ -111,11 +111,19 @@ def _run_sm120_b12x(
             int(hidden_states.shape[1]),
             str(hidden_states.dtype),
         )
-        output = _B12X_OUTPUT_CACHE.get(output_cache_key)
-        if output is None:
-            output = torch.empty_like(hidden_states)
+        cached = _B12X_OUTPUT_CACHE.get(output_cache_key)
+        # The b12x MoE kernel accumulates expert outputs into `output`, so it
+        # must start zeroed. Inplace zero_() fails when the cached buffer is an
+        # inference tensor (created under CUDA graph capture, then reused in
+        # eager prefill: "Inplace update to inference tensor outside
+        # InferenceMode"). Allocate a fresh zeros tensor in that case; the
+        # allocation is cheap relative to the MoE GEMMs.
+        if cached is not None and not torch.is_inference(cached):
+            output = cached
+            output.zero_()
+        else:
+            output = torch.zeros_like(hidden_states)
             _B12X_OUTPUT_CACHE[output_cache_key] = output
-    output.zero_()
 
     kwargs = dict(
         a=hidden_states,
