@@ -820,6 +820,19 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     dpkg dpkg-dev libdpkg-perl \
     && rm -rf /var/lib/apt/lists/*
 
+# Install Nsight Systems (nsys) for profiling. The framework stage installs
+# nsight-systems-cli but it is NOT copied into runtime (only site-packages +
+# workspace are). nsys is needed in the runtime image to profile real serving
+# workloads with `nsys profile -- python3 -m sglang.launch_server ...`.
+RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
+    apt-get update -y \
+    && apt-get install -y --no-install-recommends gnupg \
+    && echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2004/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "amd64"; fi) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
+    && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "x86_64"; fi)/7fa2af80.pub \
+    && apt-get update -y \
+    && apt-get install -y --no-install-recommends nsight-systems-cli \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copy Python site-packages from framework (already cleaned of __pycache__/tests/pyc files)
 COPY --from=framework_final /usr/local/lib/python3.12/dist-packages /usr/local/lib/python3.12/dist-packages
 
