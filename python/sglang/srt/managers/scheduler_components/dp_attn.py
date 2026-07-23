@@ -271,6 +271,10 @@ def prepare_mlp_sync_batch_raw(
         or local_batch.forward_mode.is_decode_or_idle()
         or local_batch.forward_mode.is_prebuilt()
     ) and not disable_cuda_graph
+    if local_batch is not None and getattr(
+        local_batch, "force_disable_cuda_graph", False
+    ):
+        can_run_decode_cuda_graph = False
     breakable_prefill = check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
     prefill_graph_runner = (
         model_runner.prefill_cuda_graph_runner if breakable_prefill else None
