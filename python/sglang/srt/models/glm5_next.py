@@ -100,6 +100,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _device_sm,
     _is_cuda,
     _use_aiter_gfx95,
+    quant_blocks_shared_experts_fusion,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Glm5NextMLP
@@ -1331,28 +1332,53 @@ class Glm5NextForConditionalGeneration(nn.Module):
     def end_layer(self):
         return self.model.end_layer
 
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        """Why this checkpoint cannot fuse its shared expert, or None.
+
+        Evaluated by the loader once per runner, before any layer is built
+        (``install_shared_experts_fusion_decision``), so it takes the configs
+        it is asked about rather than reading an instance. Kept in lockstep
+        with ``determine_num_fused_shared_experts`` below: a divergence drops
+        the shared-expert weights and runs the fused slot uninitialized.
+        """
+        # Need to disable if quant precision mismatch, regardless of intent.
+        if quant_blocks_shared_experts_fusion(quant_config):
+            return (
+                "Quantization keeps shared experts at a higher precision than "
+                "the routed experts, so they cannot be fused into the quantized "
+                "routed-expert path."
+            )
+        text_config = getattr(hf_config, "text_config", hf_config)
+        if not getattr(text_config, "n_shared_experts", None):
+            return "No shared experts are defined in the config."
+        if not _is_cuda:
+            return "Shared experts fusion currently requires CUDA devices."
+        if _device_sm is not None and _device_sm < 80:
+            return "Shared experts fusion requires SM80 or newer GPUs."
+        # EP>1 and DeepEP are intentionally allowed here:
+        #   * plain EP (all-reduce) stores the shared expert as a replicated
+        #     global slot and compensates the ep_size-fold sum with the
+        #     1/ep_size ``fused_shared_experts_scaling_factor``;
+        #   * DeepEP/MegaMOE fuse the shared expert into per-rank physical
+        #     slots ([routed..., shared] per rank), so it is computed once on
+        #     the home rank and never enters an all-reduce.
+        # The remaining piece is the weight-load remap below staying in
+        # lockstep with the layer build, which reads this same gate.
+        return None
+
     def determine_num_fused_shared_experts(self):
+        # Reads the same conditions as the loader-installed decision that
+        # built the layers (see shared_experts_fusion_disable_reason): the
+        # weight remap mlp.shared_experts -> mlp.experts.<n_routed> must fire
+        # iff the DeepseekV2MoE layers were built fused.
         self.num_fused_shared_experts = 0
         if get_server_args().disable_shared_experts_fusion:
             return
 
-        disable_reason = None
-        if not getattr(self.config, "n_shared_experts", None):
-            disable_reason = "No shared experts are defined in the config."
-        elif not _is_cuda:
-            disable_reason = "Shared experts fusion currently requires CUDA devices."
-        elif _is_cuda and (_device_sm is not None) and (_device_sm < 80):
-            disable_reason = "Shared experts fusion requires SM80 or newer GPUs."
-        elif get_parallel().moe_ep_size > 1:
-            disable_reason = (
-                "Shared experts fusion is not supported together with expert "
-                "parallelism yet."
-            )
-        elif get_moe_a2a_backend().is_deepep():
-            disable_reason = (
-                "Shared experts fusion is not supported when Deepep MoE backend "
-                "is enabled."
-            )
+        disable_reason = type(self).shared_experts_fusion_disable_reason(
+            self.config, self.quant_config
+        )
 
         if disable_reason is not None:
             log_info_on_rank0(
