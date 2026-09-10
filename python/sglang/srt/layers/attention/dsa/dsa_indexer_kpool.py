@@ -276,6 +276,19 @@ class IndexerKPool(MultiPlatformOp):
         if batch == 0:
             return
 
+        seq_lens_int32 = metadata.get_seqlens_int32()
+        # An eager MTP draft forward under DP attention can be physically
+        # padded with dummy rows beyond the pre-planned DSA metadata rows
+        # (PR #32209). Only the real prefix rows carry per-request kpool
+        # cache state, so trim the DP padding rows before updating the
+        # decode index cache.
+        real_batch = seq_lens_int32.shape[0]
+        if real_batch < batch:
+            key = key[:real_batch]
+            gate_score = gate_score[:real_batch]
+            positions = positions[:real_batch]
+            batch = real_batch
+
         pool = get_token_to_kv_pool()
         if hasattr(pool, "invalidate_index_buffer_for_layer"):
             pool.invalidate_index_buffer_for_layer(layer_id)

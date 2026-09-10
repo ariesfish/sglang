@@ -278,6 +278,18 @@ def get_dsa_index_kpool(config: PretrainedConfig) -> int:
     return getattr(config, "index_kpool", 1)
 
 
+def get_dsa_mtp_topk_width(config: PretrainedConfig) -> int:
+    """Return the physical index width carried by DSA MTP IndexShare.
+
+    KPool selects ``index_topk`` history tokens and appends the unpooled tail,
+    whose maximum width is ``index_kpool - 1``.  Seed buffers must preserve
+    both parts so their shape matches the indexer's output.
+    """
+    index_kpool = get_dsa_index_kpool(config)
+    assert index_kpool >= 1, f"index_kpool must be positive, got {index_kpool}"
+    return get_dsa_index_topk(config) + index_kpool - 1
+
+
 def get_dsa_index_kpool_compress(config: PretrainedConfig) -> bool:
     return getattr(config, "index_kpool_compress", False)
 

@@ -159,7 +159,27 @@ class _FpmPublisherThread:
 
         self._ctx = zmq.Context()
         self._pub = self._ctx.socket(zmq.PUB)
-        self._pub.bind(endpoint)
+        import errno as _errno
+        import os as _os
+
+        _endpoint_path = (
+            endpoint[len("ipc://") :] if endpoint.startswith("ipc://") else None
+        )
+        for _attempt in range(20):
+            try:
+                self._pub.bind(endpoint)
+                break
+            except zmq.ZMQError as _e:
+                # FPM startup race: a stale ipc file or a peer racer can hold
+                # the endpoint. Unlink a dead path and retry instead of dying.
+                if _attempt == 19 or getattr(_e, "errno", None) != _errno.EADDRINUSE:
+                    raise
+                if _endpoint_path:
+                    try:
+                        _os.unlink(_endpoint_path)
+                    except OSError:
+                        pass
+                time.sleep(0.05 + 0.1 * _attempt)
         self._zmq = zmq
 
         self._running = True

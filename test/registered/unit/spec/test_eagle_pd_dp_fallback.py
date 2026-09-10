@@ -27,12 +27,12 @@ class TestEaglePDDPFallback(CustomTestCase):
             cp_size=1,
             num_tokens=1,
             num_tokens_for_logprob=1,
-            can_cuda_graph=True,
+            can_run_decode_cuda_graph=True,
             can_draft_cuda_graph=False,
             is_extend_in_batch=False,
             local_can_run_tbo=True,
             local_forward_mode=ForwardMode.DECODE.value,
-            can_run_breakable_cuda_graph=False,
+            can_run_prefill_cuda_graph=False,
         )
 
         local = sync_info._get_local_tensor(device="cpu")

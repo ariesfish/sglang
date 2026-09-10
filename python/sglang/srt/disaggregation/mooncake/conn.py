@@ -229,6 +229,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             if transfer_thread_pool_size is None:
                 transfer_thread_pool_size = min(max(4, int(0.5 * cpu_count) // 8), 12)
             transfer_queue_size = envs.SGLANG_DISAGGREGATION_QUEUE_SIZE.get()
+            # fix.3: track cumulative tokens per room for CP aux sender selection
+            self._room_token_accum: dict = {}
             self.transfer_queues: List[FastQueue] = [
                 FastQueue() for _ in range(transfer_queue_size)
             ]
@@ -1222,6 +1224,29 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         """State types whose page lists are positional and must not be truncated."""
         return st in (StateType.SWA_RING, StateType.C128_STATE)
 
+    def _mamba_shard_sendable(self, info) -> bool:
+        """CP/TP-sharded mamba state: ranks whose shard overlaps the
+        destination must send even when skip_state is set (state is NOT
+        replicated across CP ranks for sharded linear states)."""
+        try:
+            from sglang.srt.disaggregation.utils import (
+                resolve_linear_state_shards,
+            )
+
+            if info is None:
+                return False
+            m = resolve_linear_state_shards(
+                prefill_attn_tp_size=self.attn_tp_size,
+                prefill_attn_tp_rank=self.attn_tp_rank,
+                prefill_attn_cp_size=self.attn_cp_size,
+                prefill_attn_cp_rank=self.attn_cp_rank,
+                decode_attn_tp_size=info.dst_attn_tp_size,
+                decode_tp_rank=info.dst_tp_rank,
+            )
+            return m is not None and m[0] != m[2]
+        except Exception:
+            return False
+
     def maybe_send_extra(
         self,
         req: TransferInfo,
@@ -1236,6 +1261,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 prefill_state_indices[i] if i < len(prefill_state_indices) else None
             )
             if indices is None:
+                continue
+            if (
+                st != StateType.MAMBA
+                and self._should_skip_cp_replicated_state_transfer()
+            ):
+                # Only MAMBA is un-gated for shard assembly; other
+                # CP-replicated components keep the rank-0-only semantics.
                 continue
             src_data_ptrs = self.kv_args.state_data_ptrs[i]
             src_item_lens = self.kv_args.state_item_lens[i]
@@ -1298,11 +1330,79 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         "prefill and decode must both enable it and use equal "
                         "attention TP sizes."
                     )
-                if (
+                _shard_map = None
+                try:
+                    from sglang.srt.disaggregation.utils import (
+                        resolve_linear_state_shards,
+                    )
+
+                    _shard_map = resolve_linear_state_shards(
+                        prefill_attn_tp_size=self.attn_tp_size,
+                        prefill_attn_tp_rank=self.attn_tp_rank,
+                        prefill_attn_cp_size=self.attn_cp_size,
+                        prefill_attn_cp_rank=self.attn_cp_rank,
+                        decode_attn_tp_size=(
+                            target_rank_registration_info.dst_attn_tp_size
+                            if target_rank_registration_info is not None
+                            else 1
+                        ),
+                        decode_tp_rank=(
+                            target_rank_registration_info.dst_tp_rank
+                            if target_rank_registration_info is not None
+                            else 0
+                        ),
+                    )
+                except Exception:
+                    _shard_map = None
+
+                _legacy_tp_mismatch = (
                     target_rank_registration_info is not None
                     and self.attn_tp_size
                     != target_rank_registration_info.dst_attn_tp_size
-                ):
+                )
+
+                if _shard_map is not None and _shard_map[0] != _shard_map[2]:
+                    # Sharded linear state (CP or TP): assemble the
+                    # destination slot via the slice path.
+                    (
+                        _ssz,
+                        _srk,
+                        _dsz,
+                        _drk,
+                    ) = _shard_map
+                    rc = (
+                        self._send_mamba_state_slice(
+                            req,
+                            indices,
+                            src_data_ptrs,
+                            src_item_lens,
+                            src_dim_per_tensor,
+                            dst_data_ptrs,
+                            dst_indices,
+                            dst_item_lens,
+                            dst_dim_per_tensor,
+                            (
+                                target_rank_registration_info.dst_tp_rank
+                                if target_rank_registration_info is not None
+                                else 0
+                            ),
+                            (
+                                target_rank_registration_info.dst_attn_tp_size
+                                if target_rank_registration_info is not None
+                                else 1
+                            ),
+                            src_conv_shard_groups,
+                            src_slice_outer_counts,
+                            src_state_layer_ids,
+                            dst_state_layer_ids,
+                            src_shard_size=_ssz,
+                            src_shard_rank=_srk,
+                            dst_shard_size=_dsz,
+                            dst_shard_rank=_drk,
+                        )
+                        or rc
+                    )
+                elif _shard_map is None and _legacy_tp_mismatch:
                     rc = (
                         self._send_mamba_state_slice(
                             req,
@@ -1334,6 +1434,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             dst_indices,
                             src_state_layer_ids,
                             dst_state_layer_ids,
+                            dst_item_lens,
                         )
                         or rc
                     )
@@ -1484,8 +1585,21 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_mamba_index: list,
         src_layer_ids: Optional[List[int]] = None,
         dst_layer_ids: Optional[List[int]] = None,
+        dst_state_item_lens: Optional[list[int]] = None,
     ):
         assert len(prefill_mamba_index) == 1, "Mamba should have single state index"
+
+        # Refuse empty or invalid destinations instead of silently writing
+        # to a default slot.
+        if not dst_mamba_index or int(dst_mamba_index[0]) < 0:
+            logger.error(
+                "Skip mamba state transfer for room=%s: empty/invalid "
+                "dst_mamba_index=%s (src=%s)",
+                req.room,
+                list(dst_mamba_index) if dst_mamba_index else [],
+                list(prefill_mamba_index),
+            )
+            return 0
 
         transfer_blocks = []
         pairs = build_transfer_entry_pairs(
@@ -1498,8 +1612,24 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         for i, j in pairs:
             dst_state_ptr = dst_state_data_ptrs[j]
             length = src_state_item_lens[i]
+            # The destination offset must scale with the DESTINATION slot
+            # size; using the source slot size lands the write at a wrong
+            # physical offset whenever slot widths differ between peers.
+            dst_slot_len = (
+                int(dst_state_item_lens[j])
+                if dst_state_item_lens is not None
+                and j < len(dst_state_item_lens)
+                else length
+            )
+            if dst_slot_len != length:
+                logger.warning_once(
+                    "Mamba state slot sizes differ between peers (src=%d, "
+                    "dst=%d); scaling destination offset with dst slot size",
+                    length,
+                    dst_slot_len,
+                )
             src_addr = src_state_data_ptrs[i] + length * int(prefill_mamba_index[0])
-            dst_addr = dst_state_ptr + length * int(dst_mamba_index[0])
+            dst_addr = dst_state_ptr + dst_slot_len * int(dst_mamba_index[0])
             transfer_blocks.append((src_addr, dst_addr, length))
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
@@ -1521,6 +1651,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         src_state_slice_outer_counts: list[int] = None,
         src_layer_ids: Optional[List[int]] = None,
         dst_layer_ids: Optional[List[int]] = None,
+        src_shard_size: Optional[int] = None,
+        src_shard_rank: Optional[int] = None,
+        dst_shard_size: Optional[int] = None,
+        dst_shard_rank: Optional[int] = None,
     ):
         """Transfer Mamba states with TP slice support.
 
@@ -1555,8 +1689,25 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 dst_layer_ids,
             )
 
-        local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
-        dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
+        if src_shard_size is not None:
+            # Explicit shard geometry overrides (CP/TP sharded state).
+            _eff_src_tp = int(src_shard_size)
+            local_tp_rank_in_group = int(src_shard_rank) % _eff_src_tp
+            _eff_dst_tp = (
+                int(dst_shard_size)
+                if dst_shard_size is not None
+                else dst_attn_tp_size
+            )
+            dst_tp_rank_in_group = (
+                int(dst_shard_rank) % _eff_dst_tp
+                if dst_shard_rank is not None
+                else dst_tp_rank % _eff_dst_tp
+            )
+        else:
+            _eff_src_tp = self.attn_tp_size
+            local_tp_rank_in_group = self.kv_args.engine_rank % _eff_src_tp
+            _eff_dst_tp = dst_attn_tp_size
+            dst_tp_rank_in_group = dst_tp_rank % _eff_dst_tp
 
         transfer_blocks = []
         pairs = build_transfer_entry_pairs(
@@ -1594,8 +1745,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 src_dim=src_dim,
                 dst_dim=dst_dim,
                 outer_count=outer_count,
-                src_attn_tp_size=self.attn_tp_size,
-                dst_attn_tp_size=dst_attn_tp_size,
+                src_attn_tp_size=_eff_src_tp,
+                dst_attn_tp_size=_eff_dst_tp,
                 dst_tp_rank_in_group=dst_tp_rank_in_group,
                 local_tp_rank_in_group=local_tp_rank_in_group,
                 conv_shard_groups=conv_shard_groups,
@@ -1868,7 +2019,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             break
 
                         if kv_chunk.is_last_chunk:
-                            if kv_chunk.state_indices and not skip_state:
+                            if kv_chunk.state_indices and (
+                                not skip_state
+                                or self._mamba_shard_sendable(
+                                    target_rank_registration_info
+                                )
+                            ):
                                 state_rc = self.maybe_send_extra(
                                     req,
                                     kv_chunk.state_indices,
@@ -1898,12 +2054,35 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     )
                                     break
 
-                            if should_send_aux_metadata(
-                                attn_cp_rank=self.attn_cp_rank,
-                                prefill_attn_tp_size=self.attn_tp_size,
-                                prefill_attn_tp_rank=self.attn_tp_rank,
-                                decode_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
-                                decode_attn_tp_rank=target_rank_registration_info.dst_tp_rank,
+                            # fix.3: under CP, aux metadata (output_ids,
+                            # hidden_states, dsa_topk) must come from the rank
+                            # that owns the global last token — only that
+                            # rank's scheduler computed logits from the
+                            # correct final position. Under interleave, the
+                            # last token L-1 belongs to rank (L-1) % cp_size.
+                            # The cumulative token count is tracked per room.
+                            if kv_chunk.num_kv_tokens:
+                                self._room_token_accum[kv_chunk.room] = (
+                                    self._room_token_accum.get(kv_chunk.room, 0)
+                                    + kv_chunk.num_kv_tokens
+                                )
+
+                            _aux_cp = self.attn_cp_rank  # default for cp=1
+                            if self.attn_cp_size > 1 and kv_chunk.is_last_chunk:
+                                _total = self._room_token_accum.get(
+                                    kv_chunk.room, 0
+                                )
+                                if _total > 0:
+                                    _aux_cp = (_total - 1) % self.attn_cp_size
+
+                            if (
+                                self.attn_cp_rank == _aux_cp
+                                and self.attn_tp_rank
+                                == (
+                                    target_rank_registration_info.dst_tp_rank
+                                    * self.attn_tp_size
+                                    // target_rank_registration_info.dst_attn_tp_size
+                                )
                             ):
                                 ret = self.send_aux(
                                     req,
@@ -1948,6 +2127,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
                         thread_finish_flag=True,
                     )
+
+                # fix.3: clean up token accumulator on last chunk
+                if kv_chunk.is_last_chunk:
+                    self._room_token_accum.pop(kv_chunk.room, None)
 
                 if staging_deferred:
                     continue

@@ -2155,6 +2155,24 @@ def _post_process_topk_ids(
             num_physical_routed_experts,
             topk_config,
         )
+    elif num_fused_shared_experts > 0 and (
+        fused_shared_experts_scaling_factor is not None
+    ):
+        # Plain expert parallelism (no DeepEP-class A2A backend): the fused
+        # shared expert occupies a single replicated global slot (id =
+        # n_routed_experts) that _map_global_expert_id_to_local_expert_id
+        # maps onto the trailing local slot of EVERY ep rank, so every rank
+        # computes it and the post-MoE all-reduce sums its contribution
+        # ep_size times. The eager topk implementations above pre-divide the
+        # shared weight only by routed_scaling_factor (compensating the
+        # runner epilogue's scale), so divide it by a further ep_size -- the
+        # same correction the aiter path applies through
+        # fused_append_shared_experts(scale_factor=1/ep_size). Without it
+        # the shared expert is over-weighted by ep_size (8x at ep=8) and the
+        # output degenerates.
+        topk_weights[:, -num_fused_shared_experts:] *= (
+            fused_shared_experts_scaling_factor
+        )
 
     if _is_hip and not _skip_hip_pad_mask:
         # Shared-expert append/remap can introduce non-zero weights after the

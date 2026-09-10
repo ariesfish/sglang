@@ -9,6 +9,7 @@ from sglang.srt.layers.attention.dsa_backend import (
     _restore_trtllm_decode_dp_padding,
     _trim_trtllm_decode_dp_padding,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -90,6 +91,9 @@ class TestDSABackendDPPadding(unittest.TestCase):
         backend._pad_topk_indices = MethodType(
             DeepseekSparseAttnBackend._pad_topk_indices, backend
         )
+        backend._pad_trtllm_sparse_page_table = MethodType(
+            DeepseekSparseAttnBackend._pad_trtllm_sparse_page_table, backend
+        )
 
         layer = SimpleNamespace(
             layer_id=0,
@@ -98,7 +102,14 @@ class TestDSABackendDPPadding(unittest.TestCase):
             k_scale_float=None,
             scaling=1.0,
         )
-        forward_batch = SimpleNamespace()
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            positions=torch.zeros((4,), dtype=torch.int64),
+            out_cache_loc=torch.zeros((4,), dtype=torch.int64),
+            batch_size=2,
+            seq_lens_sum=20,
+            extend_num_tokens=4,
+        )
         q = torch.arange(4 * 2 * 3, dtype=torch.float32).view(4, 2, 3)
         topk_indices = torch.arange(4 * 2, dtype=torch.int32).view(4, 2)
 

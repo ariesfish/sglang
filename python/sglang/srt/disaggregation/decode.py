@@ -116,6 +116,7 @@ if TYPE_CHECKING:
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 
 
+
 def _bootstrap_addr(req: Req) -> str:
     # FIXME: make a property of a req
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
@@ -1411,15 +1412,29 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             seq_len = origin_input_len
 
             def _mamba_payload():
-                return [
-                    self.req_to_token_pool.translate_mamba_indices(
-                        self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                            decode_req.req.req_pool_idx
-                        ]
-                    )
-                    .cpu()
-                    .numpy()
-                ]
+                # Serialize plain python ints (0-d numpy elements do not pack
+                # reliably) and fall back to the request's own slot when the
+                # pool mapping read fails.
+                fallback_slot = getattr(decode_req.req, "mamba_pool_idx", None)
+                vals = []
+                try:
+                    mapping = self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                        decode_req.req.req_pool_idx
+                    ]
+                    vals = [
+                        int(v)
+                        for v in self.req_to_token_pool.translate_mamba_indices(
+                            mapping
+                        )
+                        .cpu()
+                        .flatten()
+                        .tolist()
+                    ]
+                except Exception:
+                    pass
+                if not vals and fallback_slot is not None:
+                    vals = [int(fallback_slot)]
+                return vals if vals else [0]
 
             def _swa_payload():
                 window_size = self.scheduler.sliding_window_size

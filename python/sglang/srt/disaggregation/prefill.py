@@ -295,7 +295,114 @@ class PrefillBootstrapQueue:
                     kv_pool.v_buffer,
                     kv_pool.page_size,
                 )
+        # fix.3(C): stash a CP KV materializer for interleave-CP transfers.
+        # Built lazily on first send (see _maybe_materialize_cp_kv) so the
+        # pool tensors are resolved AFTER memory finalization, never from
+        # pre-capture placeholder spans.
+        self._cp_materializer = None
+        self._cp_materializer_resolved = False
         return kv_manager
+
+    def _init_cp_materializer(self):
+        try:
+            from sglang.srt.disaggregation.cp_kv_materialize import CPKVMaterializer
+
+            pool = self.token_to_kv_pool
+            specs = []
+            notes = []
+            full_pool = getattr(pool, "full_kv_pool", None)
+            if full_pool is None:
+                notes.append("no full_kv_pool")
+            latent_added = False
+            if full_pool is not None and hasattr(full_pool, "_pd_registerable_tensors"):
+                tensors = list(full_pool._pd_registerable_tensors())
+                try:
+                    _, _, item_lens = full_pool.get_contiguous_buf_infos()
+                except Exception as e:
+                    item_lens = []
+                    notes.append(f"latent lens failed: {e}")
+                if len(item_lens) == len(tensors) and tensors:
+                    kept = [
+                        (t, l)
+                        for t, l in zip(tensors, item_lens)
+                        if t is not None and l and int(l) > 0
+                    ]
+                    notes.append(
+                        f"latent(pd): {len(kept)}/{len(tensors)} bufs "
+                        f"({sum(int(t.numel() * t.element_size()) for t, _ in kept) / 1e6:.0f}MB)"
+                    )
+                    specs += kept
+                    latent_added = True
+                else:
+                    notes.append(
+                        f"latent(pd) mismatch {len(item_lens)} vs {len(tensors)}"
+                    )
+            elif full_pool is not None:
+                notes.append("full_pool lacks _pd_registerable_tensors")
+            # MLATokenToKVPool stores latent KV in per-layer ``kv_buffer``
+            # tensors of shape [tokens+pad, 1, kv_cache_dim]; derive page
+            # bytes from the shape so no descriptor plumbing is needed.
+            if full_pool is not None and not latent_added:
+                kvbufs = list(getattr(full_pool, "kv_buffer", None) or [])
+                kept = []
+                for t in kvbufs:
+                    if t is None or t.dim() < 2 or t.shape[0] < 1:
+                        continue
+                    per_tok = t[0].numel()
+                    page_bytes = int(per_tok) * int(t.element_size()) * int(
+                        pool.page_size
+                    )
+                    if page_bytes > 0:
+                        kept.append((t, page_bytes))
+                if kept:
+                    notes.append(
+                        f"latent(kv_buffer): {len(kept)} bufs "
+                        f"({sum(int(t.numel() * t.element_size()) for t, _ in kept) / 1e6:.0f}MB)"
+                    )
+                    specs += kept
+                else:
+                    notes.append("latent(kv_buffer) empty")
+            if getattr(pool, "use_dsa", False) and full_pool is not None:
+                ikc = getattr(full_pool, "index_key_cache", None)
+                if ikc is not None and hasattr(ikc, "buffer"):
+                    tensors = [t for t in ikc.buffer]
+                    try:
+                        _, _, item_lens = ikc.state_buf_infos()
+                    except Exception as e:
+                        item_lens = []
+                        notes.append(f"indexer lens failed: {e}")
+                    if len(item_lens) == len(tensors):
+                        kept = [
+                            (t, l)
+                            for t, l in zip(tensors, item_lens)
+                            if t is not None and l and int(l) > 0
+                        ]
+                        notes.append(
+                            f"indexer: {len(kept)}/{len(tensors)} bufs "
+                            f"({sum(int(t.numel() * t.element_size()) for t, _ in kept) / 1e6:.0f}MB)"
+                        )
+                        specs += kept
+                    else:
+                        notes.append(
+                            f"indexer len mismatch {len(item_lens)} vs {len(tensors)}"
+                        )
+                else:
+                    notes.append("index_key_cache missing buffer attr")
+            else:
+                notes.append("use_dsa false or no full pool")
+            mat = CPKVMaterializer(
+                specs,
+                pool.page_size,
+                get_parallel().attn_cp_size,
+                get_parallel().attn_cp_rank,
+            )
+            if not mat.enabled:
+                notes.append(f"disabled: {mat.reason}")
+            logger.info("[cp-kv-materialize] specs: %s", "; ".join(notes))
+            return mat
+        except Exception as e:
+            logger.warning("[cp-kv-materialize] init failed: %s", e)
+            return None
 
     def create_sender(self, req: Req, num_kv_heads: int) -> bool:
         """Create a KV sender for the request without enqueuing it.
@@ -1173,7 +1280,6 @@ class SchedulerDisaggregationPrefillMixin:
         state_indices: Optional[List] = None
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
-
             # Most state payloads read token-pool rows and should match the KV
             # range actually materialized on prefill. C128 state is request
             # scoped, so its transfer index must use the logical input length
@@ -1283,6 +1389,9 @@ class SchedulerDisaggregationPrefillMixin:
                 payloads[st]() if st in payloads else None for st in state_types
             ]
 
+        # fix.3(C): fill unwritten interleave-CP KV rows before the send.
+        self._maybe_materialize_cp_kv(req, start_idx, end_idx)
+
         if self.enable_staging:
             # One sender.send per grid slot; the sender's cumulative page
             # counter marks only the final sub-send of the final chunk as
@@ -1326,6 +1435,42 @@ class SchedulerDisaggregationPrefillMixin:
             self.disagg_prefill_pending_chunk_rids.discard(req.rid)
         else:
             self.disagg_prefill_pending_chunk_rids.add(req.rid)
+
+    def _maybe_materialize_cp_kv(self, req, start_idx: int, end_idx: int) -> None:
+        """fix.3(C): complete interleave-CP KV pages before PD transfer.
+
+        The materializer state lives on the bootstrap queue manager (built in
+        `_init_kv_manager`); this Scheduler-side hook delegates to it.
+        """
+        if end_idx <= start_idx:
+            return
+        qmgr = self.disagg_prefill_bootstrap_queue
+        mat = getattr(qmgr, "_cp_materializer", None)
+        try:
+            if not getattr(qmgr, "_cp_materializer_resolved", False):
+                qmgr._cp_materializer_resolved = True
+                mat = qmgr._init_cp_materializer()
+                qmgr._cp_materializer = mat
+            if mat is None or not mat.enabled:
+                return
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, start_idx:end_idx
+            ]
+            kv_indices = (
+                self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                    kv_indices
+                )
+            )
+            page_ids = kv_to_page_indices(kv_indices, mat.page_size)
+            mat.materialize(page_ids)
+        except Exception as e:
+            # Never block serving on the fix path; every CP rank hits the
+            # same surface, so uniform disable keeps collectives symmetric.
+            logger.error("[cp-kv-materialize] failed, disabling: %s", e)
+            try:
+                mat.enabled = False
+            except Exception:
+                pass
 
     def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
         """Release KV cache and requeue an optimistic prefill request."""

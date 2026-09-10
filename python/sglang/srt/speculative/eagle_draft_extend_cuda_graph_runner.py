@@ -251,7 +251,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         dsa_seed_topk_capture = (
             torch.full(
-                (self.max_num_token, self.eagle_worker.dsa_index_topk),
+                (self.max_num_token, self.eagle_worker.dsa_seed_topk_width),
                 -1,
                 dtype=torch.int32,
                 device=model_runner.device,
